@@ -1,11 +1,12 @@
+
 import abc
+import signal as signalmodule
 import sys
 
 
 READ = 1
 WRITE = 2
 _sys_modules = {}
-
 
 class MonkeyJail:
     def __init__(self):
@@ -86,6 +87,16 @@ class Watcher(RefMixin, metaclass=abc.ABCMeta):
         self.pending = False
         self._stop()
 
+    def close(self):
+        self.stop()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, t, v, tb):
+        self.close()
+        return
+
     def _stop(self):
         pass
 
@@ -102,7 +113,10 @@ class Watcher(RefMixin, metaclass=abc.ABCMeta):
 
 
 class TimerWatcher(Watcher):
-    def __init__(self, loop, after, ref=True):
+    def __init__(self, loop, after=0.0, repeat=0.0, ref=True, priority=None):
+        if repeat < 0.0:
+            raise ValueError("repeat must be positive or zero: %r" % repeat)
+
         super().__init__(loop, ref=ref)
         self.after = after
         self._handle = None
@@ -123,23 +137,42 @@ class TimerWatcher(Watcher):
         self.stop()
         self.start(callback=callback, *args)
 
-
 class IoWatcher(Watcher):
     def __init__(self, loop, fd, events, ref=True, priority=None):
+        if fd < 0:
+            raise ValueError("fd must be non-negative")
+
         super().__init__(loop, ref=ref)
         self.fd = fd
         self.events = events
         self._reader = events & READ
         self._writer = events & WRITE
+        self._queued = []
+
+    def _add_watcher(self, method):
+        try:
+            method(self.fd, self._invoke)
+            return
+        except OSError as ex:
+            if ex.errno != 9:
+                raise
+
+        self.args = (-1, self.fd)
+        self._invoke()
+
 
     def _start(self, pass_events=False):
         if pass_events:
             self.args = (self.events,) + self.args
+
         if self._reader:
-            self.loop.aio.add_reader(self.fd, self._invoke)
+            self._add_watcher(self.loop.aio.add_reader)
+
         if self._writer:
-            self.loop.aio.add_writer(self.fd, self._invoke)
+            self._add_watcher(self.loop.aio.add_writer)
+
         return True
+
 
     def _stop(self):
         if self._reader:
@@ -204,6 +237,9 @@ class ChildWatcher(Watcher):
 
 class SignalWatcher(Watcher):
     def __init__(self, loop, signum, ref=True):
+        if signum < 1 or signum >= signalmodule.NSIG:
+            raise ValueError('illegal signal number: %r' % signum)
+
         super().__init__(loop, ref=ref)
         self.signum = signum
 
@@ -249,9 +285,14 @@ class Callback(RefMixin):
     def pending(self):
         return self.callback is not None
 
+    def close(self):
+        self.stop()
+
 
 class Loop:
+    backend = 'default'
     MAXPRI = 0
+    approx_timer_resolution = 0.00001
 
     def __init__(self, flags=None, default=None):
         with MonkeyJail():
@@ -264,8 +305,26 @@ class Loop:
         self._stop_handle = None
         self.aio.set_exception_handler(self._handle_aio_error)
 
-    def timer(self, after, repeat=0.0, ref=True, priority=None):
-        return TimerWatcher(self, after, ref)
+    def default(self):
+        return True
+
+    def update_now(self):
+        pass
+
+    def destroy(self):
+        pass
+
+    def stat(self, path, interval=0.0, ref=True, priority=None):
+        pass
+
+    def _format(self):
+        return 'tulipcore loop'
+
+    def timer(self, *args, **kwargs):
+        return TimerWatcher(self, *args, **kwargs)
+
+    def idle(self, *args, **kwargs):
+        return TimerWatcher(self, 0)
 
     def io(self, fd, events, ref=True, priority=None):
         return IoWatcher(self, fd, events, ref, priority)
@@ -273,7 +332,7 @@ class Loop:
     def fork(self, ref=True, priority=None):
         return ForkWatcher(self, ref=ref)
 
-    def async(self, ref=True, priority=None):
+    def async_(self, ref=True, priority=None):
         return AsyncWatcher(self, ref=ref)
 
     def child(self, pid, trace=0, ref=True):
@@ -329,3 +388,11 @@ class Loop:
         self._stop_handle = None
         if self._ref_count <= 0:
             self.aio.stop()
+
+loop = Loop
+
+def supported_backends():
+    return []
+
+
+__all__ = ["Loop"]
